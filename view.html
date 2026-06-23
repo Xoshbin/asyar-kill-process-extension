@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kill Process</title>
+    <style>
+      /* Establish the height chain so the view fills the iframe viewport.
+         Without this, `.kp { height: 100% }` resolves against a height-less
+         parent → collapses to content height → the list overflows (no internal
+         scroll) and the absolutely-positioned confirm overlay centers itself in
+         the middle of the over-tall container, pushing the Kill/Cancel dialog
+         off-screen below the fold. */
+      html,
+      body,
+      #app {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./src/view.ts"></script>
+  </body>
+</html>

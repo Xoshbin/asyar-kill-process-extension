@@ -1,0 +1,34 @@
+{
+  "id": "org.asyar.kill-process",
+  "name": "Kill Process",
+  "version": "1.0.0",
+  "description": "Lists running processes by CPU or memory usage and (force) kills one. Cross-platform, with guardrails for OS-critical processes.",
+  "author": "Asyar",
+  "icon": "💀",
+  "type": "extension",
+  "asyarSdk": "^3.0.1",
+  "searchable": true,
+  "background": { "main": "dist/worker.js" },
+  "permissions": ["process:read", "process:kill"],
+  "preferences": [
+    { "name": "autoRefreshMs", "type": "number", "title": "Auto-refresh interval (ms)", "default": 3000 },
+    { "name": "showPid", "type": "checkbox", "title": "Show process IDs", "default": false },
+    { "name": "showPath", "type": "checkbox", "title": "Show executable paths", "default": false },
+    { "name": "skipConfirmation", "type": "checkbox", "title": "Skip confirmation for normal apps", "default": false },
+    { "name": "closeAfterKill", "type": "checkbox", "title": "Close launcher after killing", "default": true }
+  ],
+  "commands": [
+    { "id": "kill-process", "name": "Kill Process",
+      "description": "Lists running processes by CPU or memory usage and (force) kills one",
+      "icon": "💀", "mode": "view", "component": "KillProcessView",
+      "searchBarAccessory": {
+        "type": "dropdown",
+        "default": "cpu",
+        "options": [
+          { "value": "cpu", "title": "Sort by CPU usage" },
+          { "value": "memory", "title": "Sort by memory usage" },
+          { "value": "name", "title": "Sort by name" }
+        ]
+      } }
+  ]
+}
