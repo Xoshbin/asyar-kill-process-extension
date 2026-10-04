@@ -18,14 +18,11 @@ class KillProcessExt implements Extension {
   }
 }
 
-extensionBridge.registerManifest(manifest as unknown as Parameters<typeof extensionBridge.registerManifest>[0]);
+extensionBridge.registerManifest(
+  manifest as unknown as Parameters<typeof extensionBridge.registerManifest>[0],
+);
 extensionBridge.registerExtensionImplementation(extensionId, new KillProcessExt());
-window.parent.postMessage({ type: 'asyar:extension:loaded', extensionId, role: 'worker' }, '*');
 
 function resolveExtensionId(): string {
-  const fallback = 'org.asyar.kill-process';
-  if (window.location.hostname === 'localhost' || window.location.hostname === 'asyar-extension.localhost') {
-    return window.location.pathname.split('/').filter(Boolean)[0] || fallback;
-  }
-  return window.location.hostname || fallback;
+  return manifest.id;
 }

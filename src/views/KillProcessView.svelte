@@ -10,7 +10,7 @@
   import { ActionContext } from 'asyar-sdk/contracts';
   import { formatBytes, formatCpu } from '../lib/format';
   import { shouldConfirm } from '../lib/confirm';
-  import { VIEW_ACTION_NAMES, viewActionId } from '../lib/actions';
+  import { viewActionId } from '../lib/actions';
   import {
     buildFlatRows,
     nextIndex,
@@ -341,9 +341,6 @@
     window.removeEventListener('message', onHostMessage);
     window.removeEventListener('keydown', onLocalKeydown);
     accessoryDispose?.();
-    for (const name of VIEW_ACTION_NAMES) {
-      actions.unregisterAction(viewActionId(extensionId, name));
-    }
   });
 </script>
 
