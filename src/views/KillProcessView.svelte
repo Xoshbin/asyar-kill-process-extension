@@ -4,6 +4,7 @@
     IProcessService,
     IActionService,
     ISearchBarAccessoryService,
+    IFeedbackService,
     AppGroup,
     ProcessInfo,
   } from 'asyar-sdk/contracts';
@@ -35,57 +36,114 @@
   let { context, actions, searchBarAccessory, extensionId }: Props = $props();
 
   const processSvc = $derived(context.getService<IProcessService>('process'));
+  const feedback = $derived(context.getService<IFeedbackService>('feedback'));
+  const extensionManager = $derived(context.getService<any>('extensions'));
 
   const SORT_VALUES: SortBy[] = ['cpu', 'memory', 'name'];
   const isSortBy = (v: string): v is SortBy => (SORT_VALUES as string[]).includes(v);
 
+  // A process is "heavy" when it alone can explain a frozen desktop: it burns
+  // more than half a core, or holds more than 2 GB resident. Only the metric
+  // that crossed its own threshold is tinted, so the scan stays quiet.
+  const HOT_CPU_PERCENT = 50;
+  const HOT_MEMORY_BYTES = 2 * 1024 ** 3;
+
   let query = $state('');
-  // Sort is owned by the launcher's ⌘P accessory dropdown (declared in the
-  // manifest). The launcher persists the pick across reopens and re-seeds it
-  // via the onChange handler on mount; 'cpu' is just the pre-seed fallback.
   let sortBy = $state<SortBy>('cpu');
   let groups = $state<AppGroup[]>([]);
   let expanded = $state<Set<string>>(new Set());
+  let appGrouping = $state(true);
   let selectedIndex = $state(0);
   let pending = $state<{ group: AppGroup; force: boolean } | null>(null);
   let error = $state<string | null>(null);
   let listEl = $state<HTMLUListElement | null>(null);
+  let dialogEl = $state<HTMLDivElement | null>(null);
   let accessoryDispose: (() => void) | null = null;
 
   // The flat, keyboard-navigable sequence of rows: each group followed by its
-  // children when expanded. All navigation runs over this index space.
-  const flatRows = $derived(buildFlatRows(groups, expanded));
+  // children when expanded. When appGrouping is false, all children are flat.
+  const flatRows = $derived(buildFlatRows(groups, expanded, appGrouping));
+
+  const totalProcessCount = $derived(groups.reduce((acc, g) => acc + g.processCount, 0));
+
+  const emptyMessage = $derived(
+    query.trim()
+      ? `No running processes match "${query.trim()}"`
+      : 'No running processes',
+  );
 
   const skipConfirm = () => context.preferences?.values?.skipConfirmation === true;
   const autoRefreshMs = () => Number(context.preferences?.values?.autoRefreshMs ?? 3000);
   const showPid = () => context.preferences?.values?.showPid === true;
+  const showPath = () => context.preferences?.values?.showPath === true;
   const closeAfterKill = () => context.preferences?.values?.closeAfterKill !== false;
+
+  async function copyText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      /* fallback */
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
 
   async function reload() {
     try {
       groups = await processSvc.list({ query: query.trim() || undefined, sortBy });
       error = null;
-      // Keep the selection valid as the list grows/shrinks across reloads.
-      selectedIndex = clampIndex(selectedIndex, buildFlatRows(groups, expanded).length);
+      selectedIndex = clampIndex(selectedIndex, flatRows.length);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
   }
 
-  // Initial load + query/sort changes re-query Rust (rust-first: no client filtering/sorting).
+  // Initial load + query/sort changes re-query Rust
   $effect(() => {
     query;
     sortBy;
     void reload();
   });
 
-  // Auto-refresh poll — interval comes from a user preference (display cadence,
-  // not continuous Rust-push data), so a timer here is intentional, not banned polling.
+  // Auto-refresh poll
   $effect(() => {
     const ms = autoRefreshMs();
     if (!Number.isFinite(ms) || ms <= 0) return;
     const t = setInterval(() => void reload(), ms);
     return () => clearInterval(t);
+  });
+
+  // Move keyboard focus into dialog
+  $effect(() => {
+    if (pending) dialogEl?.focus({ preventScroll: true });
+  });
+
+  // Dynamic bottom bar action pill in launcher
+  $effect(() => {
+    if (pending) {
+      extensionManager?.setActiveViewActionLabel?.(pending.force ? 'Force Kill' : 'Kill');
+      return;
+    }
+    const row = selectedRow();
+    if (!row) {
+      extensionManager?.setActiveViewActionLabel?.('Kill');
+      return;
+    }
+    const name = row.kind === 'group' ? row.group.appName : row.child.name;
+    extensionManager?.setActiveViewActionLabel?.(`Kill ${name}`);
   });
 
   function toggle(name: string) {
@@ -99,7 +157,6 @@
   }
 
   function scrollSelectedIntoView() {
-    // Defer to next frame so the DOM reflects the new selectedIndex first.
     requestAnimationFrame(() => {
       const el = listEl?.querySelector<HTMLElement>(`[data-row-index="${selectedIndex}"]`);
       el?.scrollIntoView({ block: 'nearest' });
@@ -111,8 +168,6 @@
     scrollSelectedIntoView();
   }
 
-  // ArrowRight expands a collapsed group; ArrowLeft collapses an expanded group
-  // or, on a child row, jumps selection up to its parent group. Idempotent.
   function expandSelected() {
     const row = selectedRow();
     if (row?.kind === 'group' && !expanded.has(row.group.appName)) {
@@ -135,8 +190,6 @@
     scrollSelectedIntoView();
   }
 
-  /** A single child rendered as a one-process group, so kill routes through the
-   * same guardrail (the child carries its own `protected` flag). */
   function childAsGroup(group: AppGroup, child: ProcessInfo): AppGroup {
     return {
       ...group,
@@ -158,6 +211,12 @@
     }
   }
 
+  function killGroupAll(force: boolean) {
+    const row = selectedRow();
+    if (!row) return;
+    requestKill(row.group, force);
+  }
+
   function toggleSelected() {
     const row = selectedRow();
     if (row) toggle(row.group.appName);
@@ -165,7 +224,7 @@
 
   function requestKill(group: AppGroup, force: boolean) {
     if (shouldConfirm(group, skipConfirm())) {
-      pending = { group, force }; // protected ALWAYS confirms, ignoring skipConfirm
+      pending = { group, force };
     } else {
       void doKill(group, force, false);
     }
@@ -193,25 +252,10 @@
     }
   }
 
-  // Keys arrive from two mutually-exclusive sources depending on focus:
-  // (1) the host forwards arrows/Enter/Tab as an `asyar:view:keydown`
-  // postMessage when the launcher window has focus; (2) when our own filter
-  // input has focus the keys fire as native keydown inside the iframe. Both
-  // drive the SAME state through the shared `keyIntent` → `dispatchIntent`
-  // path (registerAction `shortcut` is display-only and does NOT bind keys).
-  // ⌘K-open is safe: when the panel is open it lives in the parent document,
-  // takes focus out of the iframe, and the launcher consumes Enter for the
-  // panel — neither source fires here.
-  // Confirm the open dialog using the SAME call its "Kill" / "Kill anyway"
-  // button uses — same confirmedProtected (the group's protected flag), so the
-  // guardrail is unchanged; this just lets ⏎ press the confirm button.
   function confirmPending() {
     if (pending) doKill(pending.group, pending.force, pending.group.protected);
   }
 
-  // Routes a key intent to an effect. When the confirm overlay is open,
-  // `resolveKeyAction` rewrites Enter → 'confirm' and swallows everything else
-  // (so arrows can't move the list under the dialog).
   function dispatchIntent(intent: ReturnType<typeof keyIntent>): boolean {
     const action = resolveKeyAction(intent, pending !== null);
     switch (action) {
@@ -228,7 +272,7 @@
         collapseSelected();
         return true;
       case 'kill':
-        killSelected(false); // routes through requestKill → shouldConfirm guardrail
+        killSelected(false);
         return true;
       case 'force-kill':
         killSelected(true);
@@ -249,45 +293,70 @@
     const data = event.data;
     if (!data || typeof data !== 'object') return;
     if (data.type === 'asyar:view:search') {
-      // Filtering is driven by the launcher's main search bar (searchable: true),
-      // forwarded here as `asyar:view:search` — same pattern as tauri-docs.
       query = data.payload?.query ?? '';
       selectedIndex = 0;
       return;
     }
     if (data.type !== 'asyar:view:keydown') return;
     const p = data.payload ?? {};
-    dispatchIntent(keyIntent({ key: p.key, meta: p.metaKey, ctrl: p.ctrlKey }));
+    dispatchIntent(
+      keyIntent({ key: p.key, meta: p.metaKey, ctrl: p.ctrlKey, alt: p.altKey }),
+    );
   }
 
   function onLocalKeydown(e: KeyboardEvent) {
-    // The host doesn't forward Escape; if our filter input has focus the local
-    // source may see it — let it cancel an open dialog (otherwise Esc pops the
-    // whole view by launcher contract, which is the desired fallback).
     if (e.key === 'Escape' && pending !== null) {
       pending = null;
       e.preventDefault();
       return;
     }
-    const handled = dispatchIntent(keyIntent({ key: e.key, meta: e.metaKey, ctrl: e.ctrlKey }));
-    // Stop arrows from moving the filter cursor and Enter from submitting.
+    if (pending !== null && e.key === 'Enter' && e.target instanceof Element) {
+      if (e.target.closest('.kp-btn')) return;
+    }
+    const handled = dispatchIntent(
+      keyIntent({ key: e.key, meta: e.metaKey, ctrl: e.ctrlKey, alt: e.altKey }),
+    );
     if (handled) e.preventDefault();
+  }
+
+  function appInitial(name: string): string {
+    const first = name.trim()[0];
+    return first ? first.toUpperCase() : '?';
+  }
+
+  const isHeavyCpu = (percent: number) => percent > HOT_CPU_PERCENT;
+  const isHeavyMemory = (bytes: number) => bytes > HOT_MEMORY_BYTES;
+
+  function groupPidLabel(group: AppGroup): string {
+    const first = group.children[0]?.pid;
+    if (first === undefined) return '';
+    const rest = group.children.length - 1;
+    return rest > 0 ? `PID ${first} +${rest}` : `PID ${first}`;
+  }
+
+  function confirmTitle(group: AppGroup): string {
+    return group.protected
+      ? `Kill system process ${group.appName}?`
+      : `Kill ${group.appName}?`;
+  }
+
+  function confirmBody(group: AppGroup, force: boolean): string {
+    if (group.protected) {
+      return 'Terminating this system process may destabilize your system or cause data loss.';
+    }
+    const count = group.processCount;
+    const scope = `This will terminate ${count} ${count === 1 ? 'process' : 'processes'}.`;
+    return force ? `${scope} It will be killed immediately.` : scope;
   }
 
   onMount(() => {
     window.addEventListener('message', onHostMessage);
     window.addEventListener('keydown', onLocalKeydown);
 
-    // Register EXTENSION_VIEW-context actions so they appear in the launcher's
-    // ⌘K drawer while this view is mounted. registerAction keeps `execute`
-    // locally and the host dispatches asyar:action:execute back to run it.
-    // (registerActionHandler — used earlier — only wires a handler for a
-    // manifest CORE action that shows when the command is selected in SEARCH,
-    // never in-view, so it was the wrong mechanism.)
     actions.registerAction({
       id: viewActionId(extensionId, 'kill'),
-      title: 'Kill Process',
-      icon: '💀',
+      title: 'Kill',
+      icon: '⊗',
       shortcut: '↵',
       category: 'Process',
       extensionId,
@@ -295,10 +364,11 @@
       destructive: true,
       execute: () => killSelected(false),
     });
+
     actions.registerAction({
       id: viewActionId(extensionId, 'force-kill'),
-      title: 'Force Kill Process',
-      icon: '⚠️',
+      title: 'Force Kill',
+      icon: '⊗',
       shortcut: '⌘↵',
       category: 'Process',
       extensionId,
@@ -306,6 +376,87 @@
       destructive: true,
       execute: () => killSelected(true),
     });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'kill-all'),
+      title: 'Kill All',
+      icon: '⊗',
+      shortcut: '⌥↵',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      destructive: true,
+      execute: () => killGroupAll(false),
+    });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'force-kill-all'),
+      title: 'Force Kill All',
+      icon: '⊗',
+      shortcut: '⌥⌘↵',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      destructive: true,
+      execute: () => killGroupAll(true),
+    });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'copy-path'),
+      title: 'Copy Path',
+      icon: '📋',
+      shortcut: '⌃⌘C',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      execute: async () => {
+        const row = selectedRow();
+        if (!row) return;
+        const path = row.kind === 'child' ? row.child.path : (row.group.children[0]?.path || '');
+        if (!path) {
+          await feedback?.showHUD('No path available');
+          return;
+        }
+        await feedback?.showHUD((await copyText(path)) ? 'Copied path' : 'Copy failed');
+      },
+    });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'copy-name'),
+      title: 'Copy Process Name',
+      icon: '📋',
+      shortcut: '⌥⌘C',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      execute: async () => {
+        const row = selectedRow();
+        if (!row) return;
+        const name = row.kind === 'child' ? row.child.name : row.group.appName;
+        await feedback?.showHUD((await copyText(name)) ? 'Copied process name' : 'Copy failed');
+      },
+    });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'copy-pid'),
+      title: 'Copy PID',
+      icon: '📋',
+      shortcut: '⌥⌘P',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      execute: async () => {
+        const row = selectedRow();
+        if (!row) return;
+        const pid = row.kind === 'child' ? String(row.child.pid) : row.group.children.map((c) => c.pid).join(', ');
+        if (!pid) {
+          await feedback?.showHUD('No PID available');
+          return;
+        }
+        await feedback?.showHUD((await copyText(pid)) ? 'Copied PID' : 'Copy failed');
+      },
+    });
+
     actions.registerAction({
       id: viewActionId(extensionId, 'toggle-expand'),
       title: 'Expand / Collapse',
@@ -316,24 +467,36 @@
       context: ActionContext.EXTENSION_VIEW,
       execute: () => toggleSelected(),
     });
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'toggle-grouping'),
+      title: appGrouping ? 'Disable App Grouping' : 'Enable App Grouping',
+      icon: '🗖',
+      shortcut: '⇧⌘G',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      execute: () => {
+        appGrouping = !appGrouping;
+        selectedIndex = 0;
+      },
+    });
+
     actions.registerAction({
       id: viewActionId(extensionId, 'refresh'),
-      title: 'Refresh',
+      title: 'Reload',
       icon: '🔄',
-      shortcut: '⌃R',
+      shortcut: '⌘R',
       category: 'Process',
       extensionId,
       context: ActionContext.EXTENSION_VIEW,
       execute: () => void reload(),
     });
 
-    // Sort is driven by the launcher's native ⌘P searchbar accessory dropdown
-    // (declared in the manifest). onChange fires with the persisted/seed value
-    // on subscribe, then on every pick — the launcher owns the value, so the
-    // view only listens (no set(): translate doesn't call it, and a mount-time
-    // set races the launcher's own seed + can reject on persistence).
     accessoryDispose = searchBarAccessory.onChange((value) => {
-      if (isSortBy(value)) sortBy = value;
+      if (!isSortBy(value) || value === sortBy) return;
+      sortBy = value;
+      selectedIndex = 0;
     });
   });
 
@@ -341,67 +504,237 @@
     window.removeEventListener('message', onHostMessage);
     window.removeEventListener('keydown', onLocalKeydown);
     accessoryDispose?.();
+    extensionManager?.setActiveViewActionLabel?.(null);
   });
 </script>
 
 <div class="kp">
-  {#if error}<p class="kp-error">{error}</p>{/if}
+  {#if error}<p class="kp-error" role="alert">{error}</p>{/if}
 
-  <ul class="kp-list custom-scrollbar" bind:this={listEl}>
-    {#each flatRows as row, i (row.kind === 'group' ? `g:${row.group.appName}` : `c:${row.child.pid}`)}
-      {#if row.kind === 'group'}
-        <li
-          class="kp-row"
-          class:protected={row.group.protected}
-          class:selected={selectedIndex === i}
-          data-row-index={i}
-        >
-          <button
-            class="kp-main"
-            onclick={() => {
-              selectedIndex = i;
-              toggle(row.group.appName);
-            }}
-          >
-            <span class="kp-name">{row.group.protected ? '⚠ ' : ''}{row.group.appName}</span>
-            <span class="kp-stat">{formatCpu(row.group.totalCpu)}</span>
-            <span class="kp-stat">{formatBytes(row.group.totalMemoryBytes)}</span>
-            <span class="kp-count"
-              >{row.group.processCount} {row.group.processCount === 1 ? 'proc' : 'procs'}</span
+  {#if flatRows.length === 0 && !error}
+    <div class="kp-empty">
+      <p>{emptyMessage}</p>
+    </div>
+  {:else}
+    <div class="kp-section-header">
+      <span class="section-title">Processes</span>
+      <span class="section-count">{totalProcessCount} running</span>
+    </div>
+
+    <ul class="kp-list custom-scrollbar" bind:this={listEl} aria-label="Running processes">
+      {#each flatRows as row, i (row.kind === 'group' ? `g:${row.group.appName}` : `c:${row.child.pid}`)}
+        {#if row.kind === 'group'}
+          {@const group = row.group}
+          {@const open = expanded.has(group.appName)}
+          {@const grouped = group.processCount > 1 && appGrouping}
+          <li class="kp-row" class:selected={selectedIndex === i} data-row-index={i}>
+            <button
+              class="kp-main"
+              title={group.appName}
+              aria-expanded={grouped ? open : undefined}
+              onclick={() => {
+                selectedIndex = i;
+                if (grouped) toggle(group.appName);
+              }}
             >
-          </button>
-        </li>
-      {:else}
-        <li
-          class="kp-row kp-child-row"
-          class:protected={row.child.protected}
-          class:selected={selectedIndex === i}
-          data-row-index={i}
-        >
-          <button class="kp-main kp-child" onclick={() => (selectedIndex = i)}>
-            <span class="kp-name">{row.child.protected ? '⚠ ' : ''}{row.child.name}</span>
-            {#if showPid()}<span class="kp-pid">{row.child.pid}</span>{/if}
-            <span class="kp-stat">{formatCpu(row.child.cpuPercent)}</span>
-            <span class="kp-stat">{formatBytes(row.child.memoryBytes)}</span>
-          </button>
-        </li>
-      {/if}
-    {/each}
-  </ul>
+              <span class="kp-lead" aria-hidden="true">
+                <span class="kp-chev" class:open>{grouped ? (open ? '⌄' : '›') : ''}</span>
+                <span class="kp-tile" class:warn={group.protected} class:exec={!group.icon}>
+                  {#if group.icon}
+                    <img
+                      src={group.icon}
+                      alt=""
+                      class="kp-app-icon"
+                      onerror={(e) => {
+                        const target = e.currentTarget as HTMLElement;
+                        target.style.display = 'none';
+                        const fallback = target.nextElementSibling as HTMLElement;
+                        if (fallback) fallback.style.display = 'flex';
+                      }}
+                    />
+                    <span class="kp-initial-fallback" style="display: none;">
+                      {appInitial(group.appName)}
+                    </span>
+                  {:else}
+                    <span class="exec-badge">exec</span>
+                  {/if}
+                </span>
+              </span>
+
+              <span class="kp-name">
+                <span class="kp-name-text">{group.appName}</span>
+                {#if grouped}
+                  <span class="kp-subtitle">
+                    {#if group.children[0]?.name && group.children[0].name.toLowerCase() !== group.appName.toLowerCase()}
+                      {group.children[0].name} - {group.processCount} processes
+                    {:else}
+                      {group.processCount} processes
+                    {/if}
+                  </span>
+                {:else if showPath() && group.children[0]?.path}
+                  <span class="kp-subtitle kp-path">{group.children[0].path}</span>
+                {/if}
+              </span>
+
+              <span class="kp-metric" class:hot={isHeavyCpu(group.totalCpu)} title="CPU">
+                <svg
+                  class="metric-icon"
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <rect x="9" y="9" width="6" height="6" />
+                  <line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" />
+                  <line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" />
+                  <line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" />
+                  <line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" />
+                </svg>
+                <span>{formatCpu(group.totalCpu)}</span>
+              </span>
+
+              <span
+                class="kp-metric mem"
+                class:warm={isHeavyMemory(group.totalMemoryBytes)}
+                title="Memory"
+              >
+                <svg
+                  class="metric-icon"
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="2" y="6" width="20" height="12" rx="2" />
+                  <line x1="6" y1="18" x2="6" y2="21" /><line x1="10" y1="18" x2="10" y2="21" />
+                  <line x1="14" y1="18" x2="14" y2="21" /><line x1="18" y1="18" x2="18" y2="21" />
+                  <circle cx="7" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" />
+                  <circle cx="17" cy="12" r="1.5" />
+                </svg>
+                <span>{formatBytes(group.totalMemoryBytes)}</span>
+              </span>
+
+              <span class="kp-meta">
+                {#if group.protected}<span class="kp-chip warn">Protected</span>{/if}
+                {#if showPid()}<span class="kp-pid">{groupPidLabel(group)}</span>{/if}
+              </span>
+            </button>
+          </li>
+        {:else}
+          <li
+            class="kp-row kp-child-row"
+            class:selected={selectedIndex === i}
+            data-row-index={i}
+          >
+            <button
+              class="kp-main"
+              title={row.child.name}
+              onclick={() => (selectedIndex = i)}
+            >
+              <span class="kp-lead" aria-hidden="true">
+                <span class="kp-chev"></span>
+                <span class="kp-tile exec">
+                  <span class="exec-badge">exec</span>
+                </span>
+              </span>
+
+              <span class="kp-name">
+                <span class="kp-name-text">{row.child.name}</span>
+                {#if showPath() && row.child.path}
+                  <span class="kp-subtitle kp-path">{row.child.path}</span>
+                {/if}
+              </span>
+
+              <span class="kp-metric" class:hot={isHeavyCpu(row.child.cpuPercent)} title="CPU">
+                <svg
+                  class="metric-icon"
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <rect x="9" y="9" width="6" height="6" />
+                  <line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" />
+                  <line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" />
+                  <line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" />
+                  <line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" />
+                </svg>
+                <span>{formatCpu(row.child.cpuPercent)}</span>
+              </span>
+
+              <span
+                class="kp-metric mem"
+                class:warm={isHeavyMemory(row.child.memoryBytes)}
+                title="Memory"
+              >
+                <svg
+                  class="metric-icon"
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="2" y="6" width="20" height="12" rx="2" />
+                  <line x1="6" y1="18" x2="6" y2="21" /><line x1="10" y1="18" x2="10" y2="21" />
+                  <line x1="14" y1="18" x2="14" y2="21" /><line x1="18" y1="18" x2="18" y2="21" />
+                  <circle cx="7" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" />
+                  <circle cx="17" cy="12" r="1.5" />
+                </svg>
+                <span>{formatBytes(row.child.memoryBytes)}</span>
+              </span>
+
+              <span class="kp-meta">
+                {#if row.child.protected}<span class="kp-chip warn">Protected</span>{/if}
+                <span class="kp-pid">PID {row.child.pid}</span>
+              </span>
+            </button>
+          </li>
+        {/if}
+      {/each}
+    </ul>
+  {/if}
 
   {#if pending}
-    <div class="kp-confirm">
-      <div class="kp-confirm-card" role="dialog" aria-modal="true">
-        <p class="kp-confirm-msg">
-          {pending.group.protected
-            ? `⚠ "${pending.group.appName}" is a protected system process. Killing it can crash your session.`
-            : `Kill "${pending.group.appName}" (${pending.group.processCount} process${pending.group.processCount === 1 ? '' : 'es'})?`}
-        </p>
-        <div class="kp-confirm-actions">
-          <button class="kp-btn kp-btn-danger" onclick={() => confirmPending()}>
-            {pending.group.protected ? 'Kill anyway' : 'Kill'}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="kp-scrim" role="presentation" onclick={() => (pending = null)}>
+      <div
+        class="kp-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="kp-confirm-title"
+        tabindex="-1"
+        bind:this={dialogEl}
+        onclick={(e) => e.stopPropagation()}
+      >
+        <h2 id="kp-confirm-title">{confirmTitle(pending.group)}</h2>
+        <p class="kp-dialog-body">{confirmBody(pending.group, pending.force)}</p>
+        <div class="kp-dialog-actions">
+          <button class="kp-btn secondary" onclick={() => (pending = null)}>Cancel</button>
+          <button class="kp-btn danger" onclick={confirmPending}>
+            {pending.force ? 'Force kill' : 'Kill process'}
           </button>
-          <button class="kp-btn" onclick={() => (pending = null)}>Cancel</button>
         </div>
       </div>
     </div>
@@ -410,123 +743,388 @@
 
 <style>
   .kp {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     color: var(--text-primary);
-    position: relative;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-base);
   }
-  .kp-list {
-    list-style: none;
-    margin: 0;
-    padding: var(--space-2);
-    overflow-y: auto;
-    flex: 1;
+
+  .kp-section-header {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4) var(--space-1);
+    flex-shrink: 0;
   }
-  .kp-main {
-    display: grid;
-    grid-template-columns: 1fr auto auto auto;
-    gap: var(--space-3);
-    align-items: center;
-    width: 100%;
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-md);
-    background: none;
-    border: none;
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-    transition: var(--transition-normal);
-  }
-  .kp-main:hover {
-    background: var(--bg-hover);
-  }
-  .kp-row.selected .kp-main {
-    background: var(--bg-selected);
-  }
-  .kp-row.protected .kp-name {
-    color: var(--accent-warning);
-  }
-  .kp-stat {
-    font-variant-numeric: tabular-nums;
+
+  .section-title {
     color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-wide, 0.02em);
   }
-  .kp-count {
+
+  .section-count {
     color: var(--text-tertiary);
     font-size: var(--font-size-xs);
   }
-  .kp-child {
-    padding-left: var(--space-5);
+
+  .kp-list {
+    flex: 1;
+    min-height: 0;
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    overflow-y: auto;
+    list-style: none;
+  }
+
+  .kp-row {
+    position: relative;
+  }
+
+  /* One row = one 38px band */
+  .kp-main {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr) 72px 88px auto;
+    column-gap: var(--space-3);
+    align-items: center;
+    width: 100%;
+    height: var(--shell-row-h);
+    margin: 0;
+    padding: 0 var(--space-3);
+    border: none;
+    border-radius: var(--radius-md);
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: default;
+    box-sizing: border-box;
+    transition: none;
+  }
+
+  .kp-main:focus,
+  .kp-main:focus-visible {
+    outline: none;
+  }
+
+  .kp-row:not(.selected) .kp-main:hover {
+    background: var(--bg-hover);
+  }
+
+  .kp-row.selected .kp-main {
+    background: var(--bg-selected);
+  }
+
+  /* ── Leading slot: chevron affordance + 22px icon tile ───────────── */
+  .kp-lead {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 22px;
+  }
+
+  .kp-chev {
+    flex: 0 0 8px;
+    width: 8px;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-sm);
+    line-height: 1;
+  }
+
+  .kp-chev.open {
     color: var(--text-secondary);
   }
-  .kp-child-row .kp-name {
+
+  .kp-tile {
+    display: grid;
+    place-items: center;
+    flex: 0 0 22px;
+    width: 22px;
+    height: 22px;
+    overflow: hidden;
+    border-radius: var(--radius-xs);
+    background: var(--bg-tertiary);
     color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
   }
-  .kp-pid {
+
+  .kp-tile.exec {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--separator);
+  }
+
+  .exec-badge {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    font-weight: 700;
+    color: var(--accent-success, #10b981);
+    letter-spacing: -0.5px;
+    line-height: 1;
+  }
+
+  .kp-app-icon {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    border-radius: var(--radius-xs);
+  }
+
+  .kp-tile.warn {
+    background: color-mix(in srgb, var(--accent-warning) 16%, transparent);
+    color: var(--accent-warning);
+  }
+
+  /* ── Name column ──────────────────────────────────────────────────────── */
+  .kp-name {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .kp-name-text {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: var(--font-size-base);
+    font-weight: 500;
+    letter-spacing: var(--tracking-tight);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .kp-subtitle {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-sm);
+  }
+
+  .kp-path {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+  }
+
+  /* ── Metrics: mono, tabular, right-aligned, with inline icon ────────── */
+  .kp-metric {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-1);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .metric-icon {
+    flex-shrink: 0;
     color: var(--text-tertiary);
   }
-  .kp-error {
-    color: var(--accent-danger);
-    padding: 0 var(--space-3);
-    margin: var(--space-1) 0;
+
+  .kp-metric.hot {
+    color: var(--accent-warning);
   }
-  .kp-confirm {
+
+  .kp-metric.hot .metric-icon {
+    color: var(--accent-warning);
+  }
+
+  .kp-metric.warm {
+    color: color-mix(in srgb, var(--accent-warning) 70%, var(--text-secondary));
+  }
+
+  .kp-metric.warm .metric-icon {
+    color: color-mix(in srgb, var(--accent-warning) 70%, var(--text-secondary));
+  }
+
+  /* ── Trailing meta: PID pill + protected chip ─────────────────────────── */
+  .kp-meta {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .kp-pid {
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--text-tertiary) 10%, transparent);
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .kp-chip {
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-full);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .kp-chip.warn {
+    background: color-mix(in srgb, var(--accent-warning) 12%, transparent);
+    color: var(--accent-warning);
+  }
+
+  /* ── Child rows: guide line ───────────────────────────────────────────── */
+  .kp-child-row::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(var(--space-3) + 19px);
+    z-index: 1;
+    border-left: 1px solid var(--separator);
+    content: '';
+    pointer-events: none;
+  }
+
+  .kp-child-row .kp-name-text {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+
+  /* ── Empty + error ────────────────────────────────────────────────────── */
+  .kp-empty {
+    display: grid;
+    flex: 1;
+    place-items: center;
+    padding: var(--space-8);
+  }
+
+  .kp-empty p {
+    margin: 0;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-md);
+    text-align: center;
+  }
+
+  .kp-error {
+    margin: 0;
+    padding: var(--space-3) var(--space-6);
+    color: var(--accent-danger);
+    font-size: var(--font-size-sm);
+  }
+
+  /* ── Confirmation ─────────────────────────────────────────────────────── */
+  .kp-scrim {
     position: absolute;
     inset: 0;
+    z-index: 10;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: var(--space-6);
-    background: color-mix(in srgb, var(--bg-primary) 80%, transparent);
+    background: var(--scrim, rgba(0, 0, 0, 0.4));
+    backdrop-filter: blur(8px);
   }
-  .kp-confirm-card {
+
+  .kp-dialog {
     display: flex;
     flex-direction: column;
-    gap: var(--space-5);
+    gap: var(--space-2);
     width: 100%;
-    max-width: 320px;
+    max-width: 340px;
     padding: var(--space-6);
-    border: 1px solid var(--border-color);
     border-radius: var(--radius-xl);
     background: var(--bg-popup);
     box-shadow: var(--shadow-popup);
-    text-align: center;
+    animation: kp-dialog-in var(--dur-quick) var(--ease-emerge);
   }
-  .kp-confirm-msg {
+
+  .kp-dialog:focus {
+    outline: none;
+  }
+
+  .kp-dialog h2 {
     margin: 0;
     color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    letter-spacing: var(--tracking-tight);
+  }
+
+  .kp-dialog-body {
+    margin: 0;
+    color: var(--text-secondary);
     font-size: var(--font-size-md);
+    line-height: 1.45;
   }
-  .kp-confirm-actions {
+
+  .kp-dialog-actions {
     display: flex;
-    justify-content: center;
+    justify-content: flex-end;
     gap: var(--space-3);
+    margin-top: var(--space-4);
   }
+
   .kp-btn {
-    padding: var(--space-2) var(--space-5);
+    height: 28px;
+    padding: 0 var(--space-5);
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    border: 1px solid var(--border-color);
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    cursor: pointer;
-    font: inherit;
+    font-family: inherit;
+    font-size: var(--font-size-md);
     font-weight: 500;
+    cursor: pointer;
     transition: var(--transition-fast);
   }
-  .kp-btn:hover {
-    background: var(--bg-hover);
-  }
-  .kp-btn:active {
-    transform: scale(0.98);
-  }
+
   .kp-btn:focus-visible {
     outline: none;
     box-shadow: var(--shadow-focus);
   }
-  .kp-btn-danger {
-    border-color: var(--accent-danger);
-    color: var(--accent-danger);
+
+  .kp-btn.secondary {
+    border-color: var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .kp-btn.secondary:hover {
+    background: var(--bg-hover);
+  }
+
+  .kp-btn.danger {
+    background: var(--accent-danger-fill);
+    color: var(--text-on-accent);
+  }
+
+  .kp-btn.danger:hover {
+    background: color-mix(in srgb, var(--accent-danger-fill) 86%, var(--text-on-accent));
+  }
+
+  @keyframes kp-dialog-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .kp-dialog {
+      animation: none;
+    }
   }
 </style>

@@ -1,3 +1,4 @@
+import 'asyar-sdk/tokens.css';
 import { mount } from 'svelte';
 import { ExtensionContext, registerIconElement, searchBarAccessory } from 'asyar-sdk/view';
 import type { IActionService } from 'asyar-sdk/contracts';

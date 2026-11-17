@@ -12,9 +12,22 @@ export type FlatRow =
 /**
  * Flatten the grouped list into the linear sequence of rows the keyboard
  * navigates over: each group, followed by its children when expanded.
+ * When `appGrouping` is false, flattens all children directly.
  */
-export function buildFlatRows(groups: AppGroup[], expanded: Set<string>): FlatRow[] {
+export function buildFlatRows(
+  groups: AppGroup[],
+  expanded: Set<string>,
+  appGrouping = true,
+): FlatRow[] {
   const rows: FlatRow[] = [];
+  if (!appGrouping) {
+    for (const group of groups) {
+      for (const child of group.children) {
+        rows.push({ kind: 'child', group, child });
+      }
+    }
+    return rows;
+  }
   for (const group of groups) {
     rows.push({ kind: 'group', group });
     if (expanded.has(group.appName)) {
@@ -61,8 +74,16 @@ export type KeyIntent =
  * include 'r' — which is fine (the ⌘K panel covers refresh when the host has
  * focus).
  */
-export function keyIntent(e: { key: string; meta?: boolean; ctrl?: boolean }): KeyIntent | null {
+export function keyIntent(e: {
+  key: string;
+  meta?: boolean;
+  ctrl?: boolean;
+  alt?: boolean;
+}): KeyIntent | null {
   const mod = e.meta === true || e.ctrl === true;
+  // ⌥⏎ is the macOS muscle memory for the destructive variant; ⌘⏎/⌃⏎ do the
+  // same on every platform. Alt only escalates Enter — Alt+R must not refresh.
+  const forceMod = mod || e.alt === true;
   switch (e.key) {
     case 'ArrowUp':
       return 'up';
@@ -73,7 +94,7 @@ export function keyIntent(e: { key: string; meta?: boolean; ctrl?: boolean }): K
     case 'ArrowLeft':
       return 'collapse';
     case 'Enter':
-      return mod ? 'force-kill' : 'kill';
+      return forceMod ? 'force-kill' : 'kill';
   }
   if ((e.key === 'r' || e.key === 'R') && mod) return 'refresh';
   return null;

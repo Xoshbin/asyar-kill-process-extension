@@ -61,15 +61,15 @@
         "options": [
           {
             "value": "cpu",
-            "title": "Sort by CPU usage"
+            "title": "CPU Usage"
           },
           {
             "value": "memory",
-            "title": "Sort by memory usage"
+            "title": "Memory Usage"
           },
           {
             "value": "name",
-            "title": "Sort by name"
+            "title": "Process Name"
           }
         ]
       }

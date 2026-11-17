@@ -43,6 +43,12 @@ describe('buildFlatRows', () => {
     const rows = buildFlatRows([group('A', [])], new Set(['A']));
     expect(rows.map((r) => r.kind)).toEqual(['group']);
   });
+
+  it('emits flat child rows directly when app grouping is disabled', () => {
+    const rows = buildFlatRows([group('A', [1, 2]), group('B', [3])], new Set(), false);
+    expect(rows.map((r) => r.kind)).toEqual(['child', 'child', 'child']);
+    expect(rows.map((r) => r.child?.pid)).toEqual([1, 2, 3]);
+  });
 });
 
 describe('nextIndex', () => {
@@ -92,9 +98,10 @@ describe('keyIntent', () => {
     expect(keyIntent({ key: 'Enter' })).toBe('kill');
   });
 
-  it('Enter with meta or ctrl is a force kill', () => {
+  it('Enter with meta, ctrl or alt is a force kill', () => {
     expect(keyIntent({ key: 'Enter', meta: true })).toBe('force-kill');
     expect(keyIntent({ key: 'Enter', ctrl: true })).toBe('force-kill');
+    expect(keyIntent({ key: 'Enter', alt: true })).toBe('force-kill');
   });
 
   it('r with meta or ctrl is refresh', () => {
