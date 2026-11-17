@@ -4,9 +4,9 @@
   "version": "1.0.3",
   "description": "Lists running processes by CPU or memory usage and (force) kills one. Cross-platform, with guardrails for OS-critical processes.",
   "author": "Asyar",
-  "icon": "💀",
+  "icon": "assets/icon.png",
   "type": "extension",
-  "asyarSdk": "^4.15.0",
+  "asyarSdk": "^4.17.0",
   "searchable": true,
   "background": {
     "main": "dist/worker.js"
