@@ -37,7 +37,6 @@
 
   const processSvc = $derived(context.getService<IProcessService>('process'));
   const feedback = $derived(context.getService<IFeedbackService>('feedback'));
-  const extensionManager = $derived(context.getService<any>('extensions'));
 
   const SORT_VALUES: SortBy[] = ['cpu', 'memory', 'name'];
   const isSortBy = (v: string): v is SortBy => (SORT_VALUES as string[]).includes(v);
@@ -131,19 +130,36 @@
     if (pending) dialogEl?.focus({ preventScroll: true });
   });
 
-  // Dynamic bottom bar action pill in launcher
+  // Primary bottom-bar action in launcher (`Enter` / primary button click)
   $effect(() => {
-    if (pending) {
-      extensionManager?.setActiveViewActionLabel?.(pending.force ? 'Force Kill' : 'Kill');
-      return;
-    }
-    const row = selectedRow();
-    if (!row) {
-      extensionManager?.setActiveViewActionLabel?.('Kill');
-      return;
-    }
-    const name = row.kind === 'group' ? row.group.appName : row.child.name;
-    extensionManager?.setActiveViewActionLabel?.(`Kill ${name}`);
+    const row = pending ? null : selectedRow();
+    const name = row ? (row.kind === 'group' ? row.group.appName : row.child.name) : null;
+    const title = pending
+      ? pending.force
+        ? 'Force Kill'
+        : 'Kill'
+      : name
+        ? `Kill ${name}`
+        : 'Kill';
+
+    actions.registerAction({
+      id: viewActionId(extensionId, 'kill'),
+      title,
+      icon: '⊗',
+      shortcut: 'Enter',
+      category: 'Process',
+      extensionId,
+      context: ActionContext.EXTENSION_VIEW,
+      primary: true,
+      disabled: !pending && !row,
+      execute: () => {
+        if (pending) {
+          confirmPending();
+        } else {
+          killSelected(false);
+        }
+      },
+    });
   });
 
   function toggle(name: string) {
@@ -305,6 +321,7 @@
   }
 
   function onLocalKeydown(e: KeyboardEvent) {
+    if (e.defaultPrevented) return;
     if (e.key === 'Escape' && pending !== null) {
       pending = null;
       e.preventDefault();
@@ -352,18 +369,6 @@
   onMount(() => {
     window.addEventListener('message', onHostMessage);
     window.addEventListener('keydown', onLocalKeydown);
-
-    actions.registerAction({
-      id: viewActionId(extensionId, 'kill'),
-      title: 'Kill',
-      icon: '⊗',
-      shortcut: '↵',
-      category: 'Process',
-      extensionId,
-      context: ActionContext.EXTENSION_VIEW,
-      destructive: true,
-      execute: () => killSelected(false),
-    });
 
     actions.registerAction({
       id: viewActionId(extensionId, 'force-kill'),
@@ -504,7 +509,7 @@
     window.removeEventListener('message', onHostMessage);
     window.removeEventListener('keydown', onLocalKeydown);
     accessoryDispose?.();
-    extensionManager?.setActiveViewActionLabel?.(null);
+    actions.unregisterAction(viewActionId(extensionId, 'kill'));
   });
 </script>
 
