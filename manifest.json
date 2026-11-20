@@ -73,5 +73,11 @@
         ]
       }
     }
+  ],
+  "category": "system",
+  "platforms": [
+    "macos",
+    "windows",
+    "linux"
   ]
 }
