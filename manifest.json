@@ -1,7 +1,7 @@
 {
   "id": "org.asyar.kill-process",
   "name": "Kill Process",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Lists running processes by CPU or memory usage and (force) kills one. Cross-platform, with guardrails for OS-critical processes.",
   "author": "Asyar",
   "icon": "assets/icon.png",

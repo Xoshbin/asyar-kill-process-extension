@@ -1,6 +1,6 @@
 {
   "name": "org.asyar.kill-process",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "List running processes by CPU or memory and (force) kill them, with guardrails for OS-critical processes.",
   "type": "module",
   "scripts": {
@@ -12,7 +12,9 @@
     "link": "asyar link",
     "package": "npm run build && zip -r extension.zip dist manifest.json"
   },
-  "dependencies": { "svelte": "^5.0.0" },
+  "dependencies": {
+    "svelte": "^5.0.0"
+  },
   "devDependencies": {
     "asyar-sdk": "^4.15.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
@@ -23,5 +25,7 @@
     "@vitest/coverage-v8": "^2.1.0",
     "rollup-plugin-css-only": "^4.5.2"
   },
-  "optionalDependencies": { "@rollup/rollup-win32-arm64-msvc": "*" }
+  "optionalDependencies": {
+    "@rollup/rollup-win32-arm64-msvc": "*"
+  }
 }
